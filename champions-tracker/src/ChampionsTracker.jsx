@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   Plus, X, Search, Trash2, Check, ChevronLeft, Swords, Trophy, Skull,
-  Calendar, Edit3, Users, BarChart3, Target, Eye, Sparkles, Download, TrendingUp, TrendingDown
+  Calendar, Edit3, Users, BarChart3, Target, Eye, Sparkles, Download, TrendingUp, TrendingDown,
+  ClipboardPaste
 } from "lucide-react";
 import * as XLSX from "xlsx";
 
@@ -320,6 +321,161 @@ const ITEMS_BY_CATEGORY = [
   { label: "Berries", items: ITEMS_BERRY },
 ];
 const ALL_ITEMS = [...ITEMS_HOLD, ...ITEMS_MEGA, ...ITEMS_BERRY];
+
+/* ============================================================================
+ * POKÉPASTE PARSER
+ *
+ * Showdown's "export format" — spec: github.com/smogon/pokemon-showdown/blob/master/sim/TEAMS.md
+ * We only care about Pokémon name, shiny flag, and item. Ability/moves/EVs/IVs/
+ * nature/level get parsed but dropped. That way legal PokéPaste strings import
+ * without error, even though we don't use the extra fields.
+ *
+ * Example input:
+ *   Orthworm @ Sitrus Berry
+ *   Ability: Earth Eater
+ *   Level: 50
+ *   Shiny: Yes
+ *   EVs: 12 HP / 6 Atk / 32 Def / 16 SpD
+ *   Impish Nature
+ *   - Body Press
+ *   - Iron Head
+ * ========================================================================== */
+
+/* Normalize a raw name to match our roster. Handles punctuation, forme suffixes
+ * ("Tauros-Paldea-Combat"), and Showdown's mega syntax ("Charizard-Mega-X"). */
+const normalizeKey = (s) => String(s).toLowerCase()
+  .replace(/[^a-z0-9]+/g, "")       // strip spaces, dashes, periods, apostrophes
+  .replace(/mega$/, "mega");        // no-op; kept for readability
+
+/* Prebuild a lookup of every known Pokémon by its normalized name. */
+const POKEMON_KEY_LOOKUP = (() => {
+  const m = {};
+  for (const p of POKEMON) {
+    m[normalizeKey(p.name)] = p;
+    m[normalizeKey(p.slug)] = p;
+  }
+  // Aliases for common Showdown spellings that don't match our names directly.
+  const aliases = {
+    // Showdown uses "Charizard-Mega-X" → we want Mega Charizard X
+    "charizardmegax": "charizard-mega-x",
+    "charizardmegay": "charizard-mega-y",
+    // regional form compact forms
+    "taurospaldeacombat": "tauros-paldea-combat",
+    "taurospaldea": "tauros-paldea-combat",
+    "raichualola": "raichu-alola",
+    "ninetalesalola": "ninetales-alola",
+    "arcaninehisui": "arcanine-hisui",
+    "slowbrogalar": "slowbro-galar",
+    "slowkinggalar": "slowking-galar",
+    "typhlosionhisui": "typhlosion-hisui",
+    "samurotthisui": "samurott-hisui",
+    "zoroarkhisui": "zoroark-hisui",
+    "stunfiskgalar": "stunfisk-galar",
+    "goodrahisui": "goodra-hisui",
+    "avalugghisui": "avalugg-hisui",
+    "decidueyehisui": "decidueye-hisui",
+    "lycanroc": "lycanroc-midday",
+    "lycanrocmidday": "lycanroc-midday",
+    "basculegion": "basculegion-male",
+    "basculegionm": "basculegion-male",
+    "palafin": "palafin-zero",
+    "mimikyu": "mimikyu-disguised",
+    "maushold": "maushold-family-of-four",
+    "mausholdfour": "maushold-family-of-four",
+    "mrrime": "mr-rime",
+    "kommoo": "kommo-o",
+  };
+  for (const [alias, slug] of Object.entries(aliases)) {
+    if (POKEMON_BY_SLUG[slug]) m[alias] = POKEMON_BY_SLUG[slug];
+  }
+  return m;
+})();
+
+const findPokemonByName = (raw) => POKEMON_KEY_LOOKUP[normalizeKey(raw)] || null;
+
+/* Item matching is case/punctuation insensitive against our Champions list.
+ * If we don't recognize it we keep the raw string — the user can fix in-app. */
+const ALL_ITEMS_LOOKUP = (() => {
+  const m = {};
+  for (const it of ALL_ITEMS) m[normalizeKey(it)] = it;
+  return m;
+})();
+const findItemByName = (raw) => {
+  if (!raw) return "";
+  const normalized = ALL_ITEMS_LOOKUP[normalizeKey(raw)];
+  return normalized || raw.trim();  // keep raw if we don't recognize — user can edit
+};
+
+/* Parses the first header line, which is the tricky part.
+ * Formats to support:
+ *   Orthworm @ Sitrus Berry
+ *   Orthworm
+ *   Volbeat (M) @ Damp Rock
+ *   Nicky (Gardevoir) (F) @ Gardevoirite
+ *   Charizard-Mega-Y @ Charizardite Y
+ * Returns { speciesRaw, item } or null. */
+const parsePokepasteHeader = (line) => {
+  // Split off " @ Item" (optional)
+  let item = "";
+  let namePart = line.trim();
+  const atIdx = namePart.lastIndexOf(" @ ");
+  if (atIdx >= 0) {
+    item = namePart.slice(atIdx + 3).trim();
+    namePart = namePart.slice(0, atIdx).trim();
+  }
+  // Strip trailing gender marker "(M)" / "(F)"
+  namePart = namePart.replace(/\s*\((?:M|F)\)\s*$/i, "").trim();
+  // If the remaining name has "Nickname (Species)", species wins
+  const speciesMatch = namePart.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+  const speciesRaw = speciesMatch ? speciesMatch[2].trim() : namePart;
+  return { speciesRaw, item };
+};
+
+/* Parse a full PokéPaste string. Returns { slots, errors, rawCount } where
+ * slots is an array of up to 6 {pokemonSlug, item, shiny} and errors is an
+ * array of human-readable warnings for unmatched species. */
+const parsePokepaste = (text) => {
+  // Blocks separated by blank lines. Trim trailing spaces from each line
+  // (Showdown's export format adds two-space line endings).
+  const blocks = text
+    .replace(/\r\n/g, "\n")
+    .split(/\n\s*\n+/)
+    .map(b => b.trim())
+    .filter(Boolean);
+
+  const slots = [];
+  const errors = [];
+
+  for (const block of blocks) {
+    if (slots.length >= 6) break;  // Champions teams are 6 max
+    const lines = block.split("\n").map(l => l.replace(/\s+$/, ""));
+    if (!lines.length) continue;
+
+    const header = parsePokepasteHeader(lines[0]);
+    if (!header) continue;
+
+    const poke = findPokemonByName(header.speciesRaw);
+    if (!poke) {
+      errors.push(`Couldn't match "${header.speciesRaw}" — skipped.`);
+      continue;
+    }
+
+    let shiny = false;
+    // Scan the remaining lines for "Shiny: Yes" (rest we ignore)
+    for (const l of lines.slice(1)) {
+      const m = l.match(/^\s*Shiny:\s*(Yes|Y|True)\s*$/i);
+      if (m) { shiny = true; break; }
+    }
+
+    slots.push({
+      pokemonSlug: poke.slug,
+      item: findItemByName(header.item),
+      shiny,
+    });
+  }
+
+  return { slots, errors, rawCount: blocks.length };
+};
 
 const itemSlug = (name) => name.toLowerCase().replace(/['\s]/g, "");
 const itemImageUrl = (name) => `https://www.serebii.net/itemdex/sprites/${itemSlug(name)}.png`;
@@ -963,6 +1119,99 @@ const LeadsSelector = ({ team, pool, leads, setLeads, label, max = 2 }) => {
 };
 
 /* ============================================================================
+ * POKÉPASTE IMPORT MODAL
+ * ========================================================================== */
+const PokepasteImportModal = ({ open, onClose, onImport }) => {
+  const [text, setText] = useState("");
+  const [preview, setPreview] = useState(null);
+
+  // Re-parse live as the user types so the preview is always in sync.
+  useEffect(() => {
+    if (!text.trim()) { setPreview(null); return; }
+    setPreview(parsePokepaste(text));
+  }, [text]);
+
+  const handleImport = () => {
+    if (!preview || preview.slots.length === 0) return;
+    onImport(preview.slots);
+    setText("");
+    setPreview(null);
+    onClose();
+  };
+
+  const handleClose = () => {
+    setText("");
+    setPreview(null);
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={handleClose} title="Import from PokéPaste">
+      <div className="import-body">
+        <p className="label-xs dim" style={{ lineHeight: 1.6 }}>
+          Paste a Showdown export / PokéPaste team below. Only Pokémon species,
+          held items, and shiny flags are imported — abilities, moves, EVs, and
+          natures are ignored.
+        </p>
+
+        <textarea
+          value={text}
+          onChange={e => setText(e.target.value)}
+          rows={14}
+          placeholder={`Orthworm @ Sitrus Berry\nAbility: Earth Eater\nLevel: 50\nShiny: Yes\nEVs: 12 HP / 6 Atk / 32 Def / 16 SpD\nImpish Nature\n- Body Press\n- Iron Head\n- Sandstorm\n- Shed Tail\n\n(paste up to 6 Pokémon, separated by blank lines)`}
+          className="input textarea import-textarea"
+        />
+
+        {preview && (
+          <div className="import-preview">
+            <div className="label-xs">
+              Parsed {preview.slots.length} of {preview.rawCount} Pokémon block{preview.rawCount !== 1 ? "s" : ""}
+            </div>
+
+            {preview.slots.length > 0 && (
+              <div className="import-preview-grid">
+                {preview.slots.map((slot, i) => {
+                  const poke = POKEMON_BY_SLUG[slot.pokemonSlug];
+                  return (
+                    <div key={i} className="import-preview-card">
+                      <PokeImage slug={slot.pokemonSlug} size={56} shiny={slot.shiny} />
+                      <div className="poke-name">
+                        {poke?.name}
+                        {slot.shiny && <span className="shiny-star"> ✨</span>}
+                      </div>
+                      {slot.item && (
+                        <div className="poke-item">
+                          <ItemIcon name={slot.item} size={12} /> {slot.item}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {preview.errors.length > 0 && (
+              <div className="import-errors">
+                {preview.errors.map((e, i) => (
+                  <div key={i} className="import-error">⚠ {e}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="import-actions">
+          <Btn variant="ghost" onClick={handleClose}>Cancel</Btn>
+          <Btn variant="primary" onClick={handleImport} disabled={!preview || preview.slots.length === 0}>
+            Import {preview?.slots.length ? `(${preview.slots.length})` : ""}
+          </Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ============================================================================
  * TEAM EDITOR
  * ========================================================================== */
 const emptyTeam = () => Array(6).fill(null).map(() => ({ pokemonSlug: null, item: "", shiny: false }));
@@ -970,6 +1219,7 @@ const emptyTeam = () => Array(6).fill(null).map(() => ({ pokemonSlug: null, item
 const TeamEditorView = ({ editing, onSave, onCancel, onDelete }) => {
   const [name, setName] = useState(editing?.name ?? "");
   const [slots, setSlots] = useState(editing?.slots ?? emptyTeam());
+  const [importOpen, setImportOpen] = useState(false);
   const canSave = name.trim() && slots.some(s => s.pokemonSlug);
 
   const handleSave = () => {
@@ -981,6 +1231,15 @@ const TeamEditorView = ({ editing, onSave, onCancel, onDelete }) => {
       createdAt: editing?.createdAt ?? Date.now(),
       updatedAt: Date.now(),
     });
+  };
+
+  // Merge imported slots into the current team. Fills from slot 0 onward,
+  // overwriting whatever's there. Extra imported Pokémon beyond 6 are ignored
+  // (the parser already caps at 6).
+  const handleImport = (imported) => {
+    const next = emptyTeam();
+    imported.forEach((s, i) => { if (i < 6) next[i] = normalizeSlot(s); });
+    setSlots(next);
   };
 
   return (
@@ -1008,6 +1267,13 @@ const TeamEditorView = ({ editing, onSave, onCancel, onDelete }) => {
           className="input input-lg" />
       </label>
 
+      <div className="row-between" style={{ alignItems: "center" }}>
+        <div className="label-xs">Build by hand — or paste a team:</div>
+        <Btn variant="outline" onClick={() => setImportOpen(true)}>
+          <ClipboardPaste size={14} /> Import PokéPaste
+        </Btn>
+      </div>
+
       <TeamBuilder team={slots} setTeam={setSlots} label="Composition" />
 
       <p className="hint">
@@ -1015,6 +1281,12 @@ const TeamEditorView = ({ editing, onSave, onCancel, onDelete }) => {
         Pokémon as shiny. Items and shiny flags save as defaults — when you log a battle with this team
         they pre-fill but can be overridden per-match.
       </p>
+
+      <PokepasteImportModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImport={handleImport}
+      />
     </div>
   );
 };
@@ -2167,6 +2439,47 @@ body, html, #root {
 }
 .item-chip-name {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+
+/* PokéPaste import modal */
+.import-body {
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.import-textarea {
+  min-height: 260px; font-size: 12px;
+  background: #09090b;
+}
+.import-preview {
+  display: flex; flex-direction: column; gap: 10px;
+}
+.import-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+@media (min-width: 640px) { .import-preview-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 768px) { .import-preview-grid { grid-template-columns: repeat(6, 1fr); } }
+.import-preview-card {
+  padding: 6px; border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.import-errors {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; border-radius: 6px;
+  background: rgba(127,29,29,0.15);
+  border: 1px solid var(--accent-dark);
+}
+.import-error {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  color: var(--accent-red-light);
+}
+.import-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
 }
 
 .meta-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
